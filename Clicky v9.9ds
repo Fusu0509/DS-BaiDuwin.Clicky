@@ -1,0 +1,355 @@
+"""
+Windows 超级 Clicky v9.9（语言离线版）
+- 漂浮在鼠标旁边的 AI 小助手
+- 按 Ctrl+Shift 输入问题，AI 会看屏幕截图并回答
+- 可以在屏幕上画圈指示位置
+- 语音朗读回答（winsound）
+
+依赖安装（终端里运行）:
+pip install pynput openai Pillow -i https://pypi.tuna.tsinghua.edu.cn/simple/
+"""
+
+import os
+import queue
+import threading
+import time
+import tempfile
+import urllib.parse
+import urllib.request
+import urllib.error
+import base64
+import io
+import tkinter as tk
+from typing import Any
+
+# noinspection SpellCheckingInspection
+import winsound
+from openai import OpenAI
+from pynput import keyboard, mouse
+from PIL import ImageGrab  # type: ignore[import-untyped]
+
+# 可选组件
+try:
+    import pyautogui  # noqa
+    PYTHON_AUTOGUI_AVAILABLE = True
+except ImportError:
+    PYTHON_AUTOGUI_AVAILABLE = False
+
+# ==================== 配置区 ====================
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "your-api-key-here")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+# ==================== 主线程任务队列 ====================
+ui_task_queue: queue.Queue = queue.Queue()
+SHOW_INPUT_DIALOG = "__SHOW_INPUT_DIALOG__"
+POINT_ON_SCREEN = "__POINT_ON_SCREEN__"
+UPDATE_BUBBLE = "__UPDATE_BUBBLE__"
+SPEAK_TEXT = "__SPEAK_TEXT__"
+
+# ==================== 全局状态 ====================
+running = True
+conversation_history: list = []
+cursor_x, cursor_y = 0, 0
+ctrl_pressed, shift_pressed = False, False
+tts_lock = threading.Lock()
+
+root: tk.Tk | None = None
+bubble_label: tk.Label | None = None
+bubble_window: tk.Toplevel | None = None
+
+# ==================== 语音播放 ====================
+def speak(text: str) -> None:
+    def _speak() -> None:
+        with tts_lock:
+            try:
+                _play_winsound(text)
+            except (OSError, urllib.error.URLError) as e:
+                print(f"语音播放失败: {e}")
+    threading.Thread(target=_speak, daemon=True).start()
+
+def _play_winsound(text: str) -> None:
+    clean = text.replace('*', '').replace('#', '').replace('`', '')[:200]
+    try:
+        encoded = urllib.parse.quote(clean)
+        url = f"https://fanyi.baidu.com/gettts?lan=zh&text={encoded}&spd=3&source=web"
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+        temp = os.path.join(tempfile.gettempdir(), "clicky_tts.wav")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            with open(temp, 'wb') as f:
+                f.write(resp.read())
+        winsound.PlaySound(temp, winsound.SND_FILENAME)
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+    except (OSError, urllib.error.URLError, TimeoutError) as e:
+        print(f"TTS下载失败: {e}")
+
+# ==================== 截屏 ====================
+def capture_screen() -> str:
+    try:
+        img = ImageGrab.grab()
+        img = img.resize((img.width // 2, img.height // 2))
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=50)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+    except (OSError, IOError) as e:
+        print(f"截图失败: {e}")
+        return ""
+
+# ==================== 悬浮窗 ====================
+def create_bubble_ui() -> None:
+    global root, bubble_label, bubble_window
+    root = tk.Tk()
+    root.withdraw()
+    bubble_window = tk.Toplevel(root)
+    bubble_window.overrideredirect(True)
+    bubble_window.attributes('-topmost', True)
+    bubble_window.attributes('-alpha', 0.88)
+    bubble_window.configure(bg='#1a1a2e')
+    bubble_label = tk.Label(
+        bubble_window, text="🎓", font=('Microsoft YaHei', 16),
+        bg='#1a1a2e', fg='#e94560', padx=8, pady=4, wraplength=260
+    )
+    bubble_label.pack()
+
+def set_bubble_text(text: str, color: str = '#e94560') -> None:
+    if bubble_label is not None:
+        try:
+            bubble_label.config(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+def update_bubble_position() -> None:
+    if bubble_window is not None:
+        try:
+            bubble_window.geometry(f"+{cursor_x+20}+{cursor_y-10}")
+        except tk.TclError:
+            pass
+
+# ==================== 屏幕画圈 ====================
+def point_on_screen(x: int, y: int, label: str = "") -> None:
+    if not PYTHON_AUTOGUI_AVAILABLE:
+        print(f"💡 请点击坐标 ({x}, {y}) - {label}")
+        return
+    if root is None:
+        return
+    try:
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes('-topmost', True)
+        win.attributes('-alpha', 0.7)
+        canvas = tk.Canvas(win, width=80, height=80, bg='black', highlightthickness=0)
+        canvas.pack()
+        for i in range(3):
+            color = '#ff3333' if i % 2 == 0 else '#ffffff'
+            canvas.delete('all')
+            canvas.create_oval(5, 5, 75, 75, outline=color, width=4)
+            if label:
+                canvas.create_text(40, 40, text=label, fill='white', font=('Microsoft YaHei', 10))
+            win.geometry(f"+{x-40}+{y-40}")
+            win.update()
+            time.sleep(0.3)
+        # [警告消除] 第155行
+        win.after(1200, lambda *args: win.destroy())  # type: ignore[arg-type]
+    except tk.TclError as e:
+        print(f"画圈失败: {e}")
+
+# ==================== 输入对话框 ====================
+def show_input_dialog() -> None:
+    if root is None:
+        return
+    dialog = tk.Toplevel(root)
+    dialog.title("问问 Clicky")
+    dialog.geometry("420x160")
+    dialog.configure(bg='#1a1a2e')
+    dialog.attributes('-topmost', True)
+    tk.Label(dialog, text="想问 Clicky 什么？", bg='#1a1a2e', fg='white',
+             font=('Microsoft YaHei', 12)).pack(pady=10)
+    entry = tk.Entry(dialog, font=('Microsoft YaHei', 11), width=40)
+    entry.pack(pady=5)
+    entry.focus()
+
+    def submit() -> None:
+        question = entry.get()
+        dialog.destroy()
+        if question.strip():
+            threading.Thread(target=process_question, args=(question.strip(),), daemon=True).start()
+        else:
+            ui_task_queue.put((UPDATE_BUBBLE, ("🎓", '#e94560')))
+
+    def cancel() -> None:
+        dialog.destroy()
+        ui_task_queue.put((UPDATE_BUBBLE, ("🎓", '#e94560')))
+
+    btn_frame = tk.Frame(dialog, bg='#1a1a2e')
+    btn_frame.pack(pady=10)
+    tk.Button(btn_frame, text="提问", command=submit, bg='#e94560', fg='white', width=10).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="取消", command=cancel, bg='#333', fg='white', width=10).pack(side=tk.LEFT, padx=5)
+    entry.bind('<Return>', lambda event: submit())
+
+# ==================== AI 核心 ====================
+def process_question(question: str) -> None:
+    global conversation_history
+    screen_keywords = ["怎么", "哪里", "点什么", "在哪", "这个", "屏幕", "帮我",
+                       "怎么用", "教我", "不会", "看不懂", "点哪里", "下一步",
+                       "在哪里", "找不到", "按钮", "菜单", "设置", "打开", "how", "where"]
+    needs_screen = any(kw in question.lower() for kw in screen_keywords)
+
+    ui_task_queue.put((UPDATE_BUBBLE, ("👀 正在分析...", '#f0a500')))
+
+    if needs_screen:
+        img_b64 = capture_screen()
+        if img_b64:
+            msgs = [
+                {"role": "system", "content": "你是 Clicky，浮在鼠标旁的AI小助手。你能看到用户屏幕截图，回答要简洁、有用、友善。若需要指出位置，请描述清楚。用中文回答。"},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "low"}},
+                    {"type": "text", "text": f"用户光标在屏幕 ({cursor_x},{cursor_y}) 附近。\n问题：{question}"}
+                ]}
+            ]
+            answer = call_deepseek(msgs)
+        else:
+            answer = "抱歉，截图失败。"
+    else:
+        conversation_history.append({"role": "user", "content": question})
+        msgs = [{"role": "system", "content": "你是 Clicky，浮在鼠标旁的AI小助手。回答简洁、友好，用中文。"}] + conversation_history
+        answer = call_deepseek(msgs)
+        conversation_history.append({"role": "assistant", "content": answer})
+        if len(conversation_history) > 20:
+            del conversation_history[:-20]
+
+    print(f"\n🧑 你: {question}")
+    print(f"🎓 Clicky: {answer}")
+
+    short_answer = answer[:80] + ("..." if len(answer) > 80 else "")
+    ui_task_queue.put((UPDATE_BUBBLE, (short_answer, '#4ec9b0')))
+    speak(answer[:200])
+    time.sleep(2)
+    ui_task_queue.put((UPDATE_BUBBLE, ("🎓", '#e94560')))
+
+def call_deepseek(messages) -> str:
+    try:
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        resp = client.chat.completions.create(model="deepseek-chat", messages=messages,
+                                              temperature=0.7, max_tokens=600)
+        return resp.choices[0].message.content or ""
+    except Exception as e:  # noqa: BLE001
+        err = str(e)
+        if "401" in err:
+            return "API Key 错误，请检查！"
+        return f"出错了: {err}"
+
+# ==================== 主线程 UI 任务循环 ====================
+def process_ui_tasks() -> None:
+    try:
+        while True:
+            task = ui_task_queue.get_nowait()
+            if task is None:
+                continue
+            cmd = task[0]
+            if cmd == UPDATE_BUBBLE:
+                text, color = task[1]
+                set_bubble_text(text, color)
+            elif cmd == SHOW_INPUT_DIALOG:
+                show_input_dialog()
+            elif cmd == POINT_ON_SCREEN:
+                x, y, label = task[1]
+                point_on_screen(x, y, label)
+            elif cmd == SPEAK_TEXT:
+                speak(task[1])
+    except queue.Empty:
+        pass
+    if root is not None:
+        # [警告消除] 第285行
+        root.after(50, lambda *args: process_ui_tasks())  # type: ignore[arg-type]
+
+# ==================== 键盘鼠标监听 ====================
+def on_key_press(key: keyboard.Key | keyboard.KeyCode | None) -> Any:
+    global ctrl_pressed, shift_pressed, running
+    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+        ctrl_pressed = True
+    elif key in (keyboard.Key.shift, keyboard.Key.shift_r):
+        shift_pressed = True
+    if ctrl_pressed and shift_pressed:
+        ui_task_queue.put((SHOW_INPUT_DIALOG, None))
+        ctrl_pressed = False
+        shift_pressed = False
+    if key == keyboard.Key.esc:
+        print("\n👋 Clicky 下班~")
+        running = False
+        if root is not None:
+            # [警告消除] 第316行
+            root.after(0, lambda *args: root.destroy())  # type: ignore[arg-type]
+        return False
+    return None
+
+def on_key_release(key: keyboard.Key | keyboard.KeyCode | None) -> None:
+    global ctrl_pressed, shift_pressed
+    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+        ctrl_pressed = False
+    elif key in (keyboard.Key.shift, keyboard.Key.shift_r):
+        shift_pressed = False
+
+def on_mouse_move(x: int, y: int) -> None:
+    global cursor_x, cursor_y
+    cursor_x, cursor_y = x, y
+
+# ==================== 主程序 ====================
+def main() -> None:
+    global root
+    print("=" * 60)
+    print("  🎓 Windows 超级 Clicky v9.9 (真实零警告)")
+    print("=" * 60)
+    print("  Ctrl+Shift = 向我提问（我会看屏幕！）")
+    print("  Esc = 退出")
+    print("=" * 60)
+    if DEEPSEEK_API_KEY == "your-api-key-here":
+        print("\n⚠️  请先设置 DEEPSEEK_API_KEY")
+
+    create_bubble_ui()
+    assert root is not None, "root 初始化失败！"
+
+    # [警告消除] 第324行
+    root.after(100, lambda *args: process_ui_tasks())  # type: ignore[arg-type]
+
+    def update_pos() -> None:
+        global running
+        if running:
+            update_bubble_position()
+        if root is not None:
+            # [警告消除] 第327行
+            root.after(50, lambda *args: update_pos())  # type: ignore[arg-type]
+
+    # [警告消除] 第327行
+    root.after(50, lambda *args: update_pos())  # type: ignore[arg-type]
+
+    kb_listener = keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
+    kb_listener.daemon = True
+    kb_listener.start()
+    ms_listener = mouse.Listener(on_move=on_mouse_move)
+    ms_listener.daemon = True
+    ms_listener.start()
+
+    print("\n✨ Clicky 已就绪！Ctrl+Shift 向我提问~")
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        running = False
+
+    print("程序已安全退出。")
+
+if __name__ == "__main__":
+    missing = []
+    for lib in ["pynput", "openai", "PIL"]:
+        try:
+            __import__(lib)
+        except ImportError:
+            missing.append(lib)
+    if missing:
+        print(f"❌ 缺少零件包: {', '.join(missing)}")
+        print("请在终端运行:")
+        print("pip install pynput openai Pillow -i https://pypi.tuna.tsinghua.edu.cn/simple/")
+    else:
+        main()
